@@ -1,0 +1,15 @@
+/dist
+/node_modules
+/coverage
+/logs
+/public/output
+/public/temp
+/public/uploads
+/baileys_auth_info
+
+package-lock.json
+yarn-error.log
+.idea/
+.DS_Store
+
+.env

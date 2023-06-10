@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
 import makeWaSocket, {
+  Browsers,
   DisconnectReason,
   delay,
   fetchLatestBaileysVersion,
@@ -11,17 +12,14 @@ import makeWaSocket, {
   type AnyMessageContent,
   type WAMessageContent,
   type WAMessageKey,
-  Browsers,
 } from '@whiskeysockets/baileys'
-import compression from 'compression'
-import cors from 'cors'
 import express, { type Request, type Response } from 'express'
-import { Phonenumber } from 'expresso-core'
+import { Phonenumber, ms } from 'expresso-core'
 import http from 'http'
 import _ from 'lodash'
-import path from 'path'
 import pino from 'pino'
-import pinoHttp from 'pino-http'
+import app from './config/app'
+import whatsappSchema from './schema/whatsapp.schema'
 
 const logger = pino({
   transport: {
@@ -40,58 +38,12 @@ const doReplies = !process.argv.includes('--no-reply')
 const store = useStore ? makeInMemoryStore({ logger }) : undefined
 store?.readFromFile('./baileys_store_multi.json')
 
-// save every 10s
+// save every 12s
 setInterval(() => {
   store?.writeToFile('./baileys_store_multi.json')
-}, 10_000)
+}, ms('12s'))
 
 const phoneHelper = new Phonenumber({ country: 'ID' })
-
-/**
- * Initialize Express App
- */
-const app = express()
-app.use(compression())
-app.use(cors())
-app.use(
-  pinoHttp({
-    transport: {
-      target: 'pino-pretty',
-      options: {
-        colorize: true,
-        ignore: 'req,res,responseTime',
-      },
-    },
-
-    // Define a custom receive message
-    customReceivedMessage: function (req, res) {
-      // @ts-expect-error
-      const endpoint = `${req?.hostname}${req?.originalUrl}`
-
-      return `request received: ${req.method} ${endpoint}`
-    },
-
-    // Define a custom success message
-    customSuccessMessage: function (req, res) {
-      // @ts-expect-error
-      const endpoint = `${req?.hostname}${req?.originalUrl}`
-
-      if (res.statusCode === 404) {
-        return 'resource not found'
-      }
-
-      return `${res.statusCode} ${req.method} ${endpoint} completed`
-    },
-
-    // Define a custom error message
-    customErrorMessage: function (req, res, err) {
-      return `request errored with status code: ${res.statusCode}, error : ${err.message}`
-    },
-  })
-)
-app.use(express.json({ limit: '200mb', type: 'application/json' }))
-app.use(express.urlencoded({ extended: true }))
-app.use(express.static(path.resolve(`${__dirname}/../public`)))
 
 /**
  * Connect To Whatsapp
@@ -102,8 +54,9 @@ async function connectToWhatsapp(): Promise<typeof makeWaSocket> {
 
   // fetch latest version of WA Web
   const { version, isLatest } = await fetchLatestBaileysVersion()
-  console.log(`using WA v${version.join('.')}, isLatest: ${isLatest}`)
+  logger.info(`Using WA v${version.join('.')}, isLatest: ${isLatest}`)
 
+  // Initialize Whatsapp Socket
   const sock = makeWaSocket({
     version,
     logger,
@@ -159,11 +112,11 @@ async function connectToWhatsapp(): Promise<typeof makeWaSocket> {
           ) {
             void connectToWhatsapp()
           } else {
-            console.log('Connection closed. You are logged out.')
+            logger.info('Connection closed. You are logged out.')
           }
         }
 
-        console.log('connection update', update)
+        logger.info('connection update', update)
       }
 
       // credentials updated -- save them
@@ -187,7 +140,7 @@ async function connectToWhatsapp(): Promise<typeof makeWaSocket> {
       if (events['messaging-history.set']) {
         const { chats, contacts, messages, isLatest } =
           events['messaging-history.set']
-        console.log(
+        logger.info(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest})`
         )
       }
@@ -195,12 +148,13 @@ async function connectToWhatsapp(): Promise<typeof makeWaSocket> {
       // received a new message
       if (events['messages.upsert']) {
         const upsert = events['messages.upsert']
-        console.log('recv messages ', JSON.stringify(upsert, undefined, 2))
+        logger.info('recv messages ', JSON.stringify(upsert, undefined, 2))
 
         if (upsert.type === 'notify') {
           for (const msg of upsert.messages) {
             if (!msg.key.fromMe && doReplies) {
-              console.log('replying to', msg.key.remoteJid)
+              logger.info('replying to', msg.key.remoteJid)
+
               await sock.readMessages([msg.key])
               await sendMessageWTyping(
                 { text: 'Hello there!' },
@@ -214,13 +168,13 @@ async function connectToWhatsapp(): Promise<typeof makeWaSocket> {
 
       // messages updated like status delivered, message deleted etc.
       if (events['messages.update']) {
-        console.log(JSON.stringify(events['messages.update'], undefined, 2))
+        logger.info(JSON.stringify(events['messages.update'], undefined, 2))
 
         for (const { key, update } of events['messages.update']) {
           if (update.pollUpdates) {
             const pollCreation = await getMessage(key)
             if (pollCreation) {
-              console.log(
+              logger.info(
                 'got poll update, aggregation: ',
                 getAggregateVotesInPollMessage({
                   message: pollCreation,
@@ -268,6 +222,7 @@ async function connectToWhatsapp(): Promise<typeof makeWaSocket> {
     }
   )
 
+  // root api
   app.get('/', async function root(req: Request, res: Response) {
     return res.status(200).json({
       code: 200,
@@ -276,19 +231,27 @@ async function connectToWhatsapp(): Promise<typeof makeWaSocket> {
     })
   })
 
-  app.get('/v1', async function root(req: Request, res: Response) {
+  // declare version 1
+  app.get('/v1', async function version1(req: Request, res: Response) {
     return res.status(403).json({ code: 403, message: 'Forbidden' })
   })
 
+  // declare router
   const router = express.Router()
   app.use('/v1', router)
 
+  // send message
   router.post(
     '/send-message',
     async function sendMessage(req: Request, res: Response) {
-      const { phone, message } = req.body
+      const formData = req.body
 
-      const newPhone = phoneHelper.formatWhatsapp(phone)
+      const value = whatsappSchema.sendMessage.validateSync(formData, {
+        abortEarly: false,
+        stripUnknown: true,
+      })
+
+      const newPhone = phoneHelper.formatWhatsapp(value.phone)
 
       if (sock.user) {
         const phoneWa = await sock.onWhatsApp(newPhone)
@@ -301,7 +264,7 @@ async function connectToWhatsapp(): Promise<typeof makeWaSocket> {
 
         const jid = phoneWa[0].jid
 
-        const data = await sock.sendMessage(jid, { text: message })
+        const data = await sock.sendMessage(jid, { text: value.message })
         return res.status(200).json({ data })
       }
 
@@ -314,6 +277,11 @@ async function connectToWhatsapp(): Promise<typeof makeWaSocket> {
   return sock
 }
 
+/**
+ *
+ * @param key
+ * @returns
+ */
 async function getMessage(
   key: WAMessageKey
 ): Promise<WAMessageContent | undefined> {
@@ -326,12 +294,12 @@ async function getMessage(
   return proto.Message.fromObject({})
 }
 
-// Run Whatsapp Socker
+// Connect To Whatsapp
 void connectToWhatsapp().then(() => {
   const port = process.env.PORT ?? 8000
   const server = http.createServer(app)
 
   server.listen(port, () => {
-    logger.info(`[server]: Listening on port ${port}`)
+    logger.info(`Listening on port ${port}`)
   })
 })

@@ -6,6 +6,7 @@
 /public/temp
 /public/uploads
 /baileys_auth_info
+baileys_store_multi.json
 
 package-lock.json
 yarn-error.log

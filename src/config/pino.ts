@@ -1,10 +1,20 @@
+import { pino } from 'pino'
 import pinoHttp, { type HttpLogger } from 'pino-http'
+
+export const logger = pino({
+  transport: {
+    target: 'pino-pretty',
+    options: {
+      colorize: true,
+    },
+  },
+})
 
 /**
  * Pino Http Logger for Express
  * @returns
  */
-export function pinoLoggerHttp(): HttpLogger {
+export function httpLogger(): HttpLogger {
   return pinoHttp({
     transport: {
       target: 'pino-pretty',

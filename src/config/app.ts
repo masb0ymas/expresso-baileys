@@ -6,6 +6,7 @@ import helmet from 'helmet'
 import i18nextMiddleware from 'i18next-http-middleware'
 import _ from 'lodash'
 import path from 'path'
+import requestIp from 'request-ip'
 import expressErrorResponse from '~/app/middleware/expressErrorResponse'
 import expressErrorTypeORM from '~/app/middleware/expressErrorTypeORM'
 import expressErrorYup from '~/app/middleware/expressErrorYups'
@@ -43,8 +44,9 @@ export class App {
     this._app.use(express.json({ limit: '200mb', type: 'application/json' }))
     this._app.use(express.urlencoded({ extended: true }))
     this._app.use(express.static(path.resolve(`${__dirname}/../../public`)))
-    this._app.use(userAgent.express())
     this._app.use(i18nextMiddleware.handle(i18n))
+    this._app.use(requestIp.mw())
+    this._app.use(userAgent.express())
 
     // middleware
     this._app.use(expressRateLimit())

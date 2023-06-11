@@ -120,10 +120,25 @@ const mailEnv = {
   OAUTH_REFRESH_TOKEN: getEnv('OAUTH_REFRESH_TOKEN'),
 }
 
+/**
+ * Storage Env
+ */
+const storageEnv = {
+  STORAGE_PROVIDER: getEnv('STORAGE_PROVIDER', 'minio'),
+  STORAGE_HOST: getEnv('STORAGE_HOST', '127.0.0.1'),
+  STORAGE_PORT: getEnv('STORAGE_PORT', 9000),
+  STORAGE_ACCESS_KEY: getEnv('STORAGE_ACCESS_KEY'),
+  STORAGE_SECRET_KEY: getEnv('STORAGE_SECRET_KEY'),
+  STORAGE_BUCKET_NAME: getEnv('STORAGE_BUCKET_NAME', 'expresso'),
+  STORAGE_REGION: getEnv('STORAGE_REGION', 'ap-southeast-1'),
+  STORAGE_SIGN_EXPIRED: getEnv('STORAGE_SIGN_EXPIRED', '7d'),
+}
+
 export const env = {
   ...appEnv,
   ...secretEnv,
   ...baseURLEnv,
   ...databaseEnv,
   ...mailEnv,
+  ...storageEnv,
 }

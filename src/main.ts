@@ -10,6 +10,9 @@ import { connectToWhatsapp } from './app/service/wasocket.service'
 function bootstrap(): void {
   const port = env.APP_PORT
 
+  // run wa socket
+  void connectToWhatsapp()
+
   // create express app
   const app = new App().create()
   const server = http.createServer(app)
@@ -21,9 +24,6 @@ function bootstrap(): void {
   server.listen(port)
   server.on('error', onError)
   server.on('listening', onListening)
-
-  // run wa socket
-  void connectToWhatsapp()
 }
 
 bootstrap()

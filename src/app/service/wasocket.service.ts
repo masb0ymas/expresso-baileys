@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/ban-types */
 /* eslint-disable @typescript-eslint/no-non-null-assertion */
 import makeWaSocket, {
   Browsers,
@@ -12,20 +13,35 @@ import makeWaSocket, {
   type AnyMessageContent,
   type WAMessageContent,
   type WAMessageKey,
+  type WASocket,
 } from '@whiskeysockets/baileys'
-import express, { type Request, type Response } from 'express'
-import { Phonenumber, ms } from 'expresso-core'
-import _ from 'lodash'
+import { ms } from 'expresso-core'
+import fs from 'fs'
+import path from 'path'
 import { logger } from '~/config/pino'
-import { yupOptions } from '~/core/utils/yup'
-import whatsappSchema from '../schema/whatsapp.schema'
+import ResponseError from '~/core/modules/response/ResponseError'
 
-const route = express.Router()
+interface IConnectWhatsapp {
+  session_id: string
+  options?: {
+    printQRCode?: boolean
+  }
+}
 
-const phoneHelper = new Phonenumber({ country: 'ID' })
+interface IOnQRUpdated {
+  session_id: string
+  qrcode: string
+}
+
+// const phoneHelper = new Phonenumber({ country: 'ID' })
 
 const useStore = !process.argv.includes('--no-store')
 const doReplies = !process.argv.includes('--no-reply')
+
+// initialize
+const WaSessions = new Map<string, WASocket>()
+const WaCallback = new Map<string, Function>()
+const WaRetryCount = new Map<string, number>()
 
 // the store maintains the data of the WA connection in memory
 // can be written out to a file & read from it
@@ -38,237 +54,396 @@ setInterval(() => {
 }, ms('12s'))
 
 /**
+ *
+ * @param session_id
+ * @returns
+ */
+function authStorage(session_id: string): string {
+  const result = `./temp/${session_id}_credentials`
+
+  return result
+}
+
+/**
  * Connect To Whatsapp
  * @returns
  */
-export async function connectToWhatsapp(): Promise<typeof makeWaSocket> {
-  const { state, saveCreds } = await useMultiFileAuthState(
-    './temp/baileys_auth_info'
-  )
+export async function startBaileys(
+  values: IConnectWhatsapp
+): Promise<WASocket> {
+  const { session_id, options } = values
 
-  // fetch latest version of WA Web
-  const { version, isLatest } = await fetchLatestBaileysVersion()
-  logger.info(`Using WA v${version.join('.')}, isLatest: ${isLatest}`)
+  // Connecting To Whatsapp
+  const startWaSocket = async (): Promise<WASocket> => {
+    // credentials
+    const storageFileAuth = authStorage(session_id)
+    const { state, saveCreds } = await useMultiFileAuthState(storageFileAuth)
 
-  // Initialize Whatsapp Socket
-  const sock = makeWaSocket({
-    version,
-    logger,
-    browser: Browsers.macOS('Safari'),
-    syncFullHistory: true,
-    printQRInTerminal: true,
-    auth: {
-      creds: state.creds,
-      /** caching makes the store faster to send/recv messages */
-      keys: makeCacheableSignalKeyStore(state.keys, logger),
-    },
-    generateHighQualityLinkPreview: true,
-  })
+    // fetch latest version of WA Web
+    const { version, isLatest } = await fetchLatestBaileysVersion()
+    logger.info(`Using WA v${version.join('.')}, isLatest: ${isLatest}`)
 
-  store?.bind(sock.ev)
+    // Initialize Whatsapp Socket
+    const sock: WASocket = makeWaSocket({
+      version,
+      logger,
+      browser: Browsers.macOS('Safari'),
+      syncFullHistory: true,
+      printQRInTerminal: options?.printQRCode ?? true,
+      auth: {
+        creds: state.creds,
+        /** caching makes the store faster to send/recv messages */
+        keys: makeCacheableSignalKeyStore(state.keys, logger),
+      },
+      generateHighQualityLinkPreview: true,
+    })
 
-  /**
-   *
-   * @param msg
-   * @param jid
-   */
-  const sendMessageWTyping = async (
-    msg: AnyMessageContent,
-    jid: string
-  ): Promise<void> => {
-    await sock.presenceSubscribe(jid)
-    await delay(500)
+    store?.bind(sock.ev)
 
-    await sock.sendPresenceUpdate('composing', jid)
-    await delay(2000)
+    // set session
+    WaSessions.set(session_id, { ...sock })
 
-    await sock.sendPresenceUpdate('paused', jid)
+    /**
+     *
+     * @param msg
+     * @param jid
+     */
+    async function sendMessageWTyping(
+      msg: AnyMessageContent,
+      jid: string
+    ): Promise<void> {
+      await sock.presenceSubscribe(jid)
+      await delay(500)
 
-    await sock.sendMessage(jid, msg)
+      await sock.sendPresenceUpdate('composing', jid)
+      await delay(2000)
+
+      await sock.sendPresenceUpdate('paused', jid)
+
+      await sock.sendMessage(jid, msg)
+    }
+
+    /**
+     *
+     * @param key
+     * @returns
+     */
+    async function getMessage(
+      key: WAMessageKey
+    ): Promise<WAMessageContent | undefined> {
+      if (store) {
+        const msg = await store.loadMessage(key.remoteJid!, key.id!)
+        return msg?.message ?? undefined
+      }
+
+      // only if store is present
+      return proto.Message.fromObject({})
+    }
+
+    // the process function lets you process all events that just occurred
+    // efficiently in a batch
+    sock.ev.process(
+      // events is a map for event name => event data
+      async (events) => {
+        // something about the connection changed
+        // maybe it closed, or we received all offline message or connection opened
+        if (events['connection.update']) {
+          const update = events['connection.update']
+          const { connection, lastDisconnect } = update
+
+          // check update qrcode
+          if (update.qr) {
+            WaCallback.get('on-qr')?.({
+              session_id,
+              qr: update.qr,
+            })
+          }
+
+          // check connecting
+          if (connection === 'connecting') {
+            WaCallback.get('on-connecting')?.(session_id)
+          }
+
+          if (connection === 'close') {
+            // @ts-expect-error
+            const statusCode = lastDisconnect?.error?.output?.statusCode
+            let retryCount = WaRetryCount.get(session_id) ?? 0
+
+            let isRetry: boolean = false
+
+            // reconnect if not logged out
+            if (statusCode !== DisconnectReason.loggedOut && retryCount < 10) {
+              isRetry = true
+            }
+
+            if (isRetry) {
+              retryCount += 1
+
+              WaRetryCount.set(session_id, retryCount)
+              await startWaSocket()
+            } else {
+              WaRetryCount.delete(session_id)
+              await deleteSession(session_id)
+              WaCallback.get('on-disconnected')?.(session_id)
+
+              logger.info('Connection closed. You are logged out.')
+            }
+          }
+
+          if (connection === 'open') {
+            WaRetryCount.delete(session_id)
+            WaCallback.get('on-connected')?.(session_id)
+          }
+
+          logger.info('connection update', update)
+        }
+
+        // credentials updated -- save them
+        if (events['creds.update']) {
+          await saveCreds()
+        }
+
+        if (events['labels.association']) {
+          console.log(events['labels.association'])
+        }
+
+        if (events['labels.edit']) {
+          console.log(events['labels.edit'])
+        }
+
+        if (events.call) {
+          console.log('recv call event', events.call)
+        }
+
+        // history received
+        if (events['messaging-history.set']) {
+          const { chats, contacts, messages, isLatest } =
+            events['messaging-history.set']
+          logger.info(
+            `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest})`
+          )
+        }
+
+        // received a new message
+        if (events['messages.upsert']) {
+          const upsert = events['messages.upsert']
+          logger.info('recv messages ', JSON.stringify(upsert, undefined, 2))
+
+          if (upsert.type === 'notify') {
+            for (const msg of upsert.messages) {
+              if (!msg.key.fromMe && doReplies) {
+                logger.info('replying to', msg.key.remoteJid)
+
+                await sock.readMessages([msg.key])
+                await sendMessageWTyping(
+                  { text: 'Hello there!' },
+
+                  msg.key.remoteJid!
+                )
+              }
+            }
+          }
+        }
+
+        // messages updated like status delivered, message deleted etc.
+        if (events['messages.update']) {
+          logger.info(JSON.stringify(events['messages.update'], undefined, 2))
+
+          for (const { key, update } of events['messages.update']) {
+            if (update.pollUpdates) {
+              const pollCreation = await getMessage(key)
+              if (pollCreation) {
+                logger.info(
+                  'got poll update, aggregation: ',
+                  getAggregateVotesInPollMessage({
+                    message: pollCreation,
+                    pollUpdates: update.pollUpdates,
+                  })
+                )
+              }
+            }
+          }
+        }
+
+        if (events['message-receipt.update']) {
+          logger.info(events['message-receipt.update'])
+        }
+
+        if (events['messages.reaction']) {
+          logger.info(events['messages.reaction'])
+        }
+
+        if (events['presence.update']) {
+          logger.info(events['presence.update'])
+        }
+
+        if (events['chats.update']) {
+          logger.info(events['chats.update'])
+        }
+
+        if (events['contacts.update']) {
+          for (const contact of events['contacts.update']) {
+            if (typeof contact.imgUrl !== 'undefined') {
+              const newUrl =
+                contact.imgUrl === null
+                  ? null
+                  : await sock.profilePictureUrl(contact.id!).catch(() => null)
+
+              logger.info(
+                `contact ${contact.id} has a new profile pic: ${newUrl}`
+              )
+            }
+          }
+        }
+
+        if (events['chats.delete']) {
+          logger.info('chats deleted ', events['chats.delete'])
+        }
+      }
+    )
+
+    return sock
   }
 
-  // the process function lets you process all events that just occurred
-  // efficiently in a batch
-  sock.ev.process(
-    // events is a map for event name => event data
-    async (events) => {
-      // something about the connection changed
-      // maybe it closed, or we received all offline message or connection opened
-      if (events['connection.update']) {
-        const update = events['connection.update']
-        const { connection, lastDisconnect } = update
-        if (connection === 'close') {
-          // reconnect if not logged out
-          if (
-            // @ts-expect-error
-            lastDisconnect?.error?.output?.statusCode !==
-            DisconnectReason.loggedOut
-          ) {
-            void connectToWhatsapp()
-          } else {
-            logger.info('Connection closed. You are logged out.')
-          }
-        }
-
-        logger.info('connection update', update)
-      }
-
-      // credentials updated -- save them
-      if (events['creds.update']) {
-        await saveCreds()
-      }
-
-      if (events['labels.association']) {
-        console.log(events['labels.association'])
-      }
-
-      if (events['labels.edit']) {
-        console.log(events['labels.edit'])
-      }
-
-      if (events.call) {
-        console.log('recv call event', events.call)
-      }
-
-      // history received
-      if (events['messaging-history.set']) {
-        const { chats, contacts, messages, isLatest } =
-          events['messaging-history.set']
-        logger.info(
-          `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest})`
-        )
-      }
-
-      // received a new message
-      if (events['messages.upsert']) {
-        const upsert = events['messages.upsert']
-        logger.info('recv messages ', JSON.stringify(upsert, undefined, 2))
-
-        if (upsert.type === 'notify') {
-          for (const msg of upsert.messages) {
-            if (!msg.key.fromMe && doReplies) {
-              logger.info('replying to', msg.key.remoteJid)
-
-              await sock.readMessages([msg.key])
-              await sendMessageWTyping(
-                { text: 'Hello there!' },
-
-                msg.key.remoteJid!
-              )
-            }
-          }
-        }
-      }
-
-      // messages updated like status delivered, message deleted etc.
-      if (events['messages.update']) {
-        logger.info(JSON.stringify(events['messages.update'], undefined, 2))
-
-        for (const { key, update } of events['messages.update']) {
-          if (update.pollUpdates) {
-            const pollCreation = await getMessage(key)
-            if (pollCreation) {
-              logger.info(
-                'got poll update, aggregation: ',
-                getAggregateVotesInPollMessage({
-                  message: pollCreation,
-                  pollUpdates: update.pollUpdates,
-                })
-              )
-            }
-          }
-        }
-      }
-
-      if (events['message-receipt.update']) {
-        logger.info(events['message-receipt.update'])
-      }
-
-      if (events['messages.reaction']) {
-        logger.info(events['messages.reaction'])
-      }
-
-      if (events['presence.update']) {
-        logger.info(events['presence.update'])
-      }
-
-      if (events['chats.update']) {
-        logger.info(events['chats.update'])
-      }
-
-      if (events['contacts.update']) {
-        for (const contact of events['contacts.update']) {
-          if (typeof contact.imgUrl !== 'undefined') {
-            const newUrl =
-              contact.imgUrl === null
-                ? null
-                : await sock.profilePictureUrl(contact.id!).catch(() => null)
-
-            logger.info(
-              `contact ${contact.id} has a new profile pic: ${newUrl}`
-            )
-          }
-        }
-      }
-
-      if (events['chats.delete']) {
-        logger.info('chats deleted ', events['chats.delete'])
-      }
-    }
-  )
-
-  // send message
-  route.post(
-    '/send-message',
-    async function sendMessage(req: Request, res: Response) {
-      const formData = req.body
-
-      const value = whatsappSchema.sendMessage.validateSync(
-        formData,
-        yupOptions
-      )
-
-      const newPhone = phoneHelper.formatWhatsapp(value.phone)
-
-      if (sock.user) {
-        const phoneWa = await sock.onWhatsApp(newPhone)
-        console.log({ phoneWa })
-
-        if (_.isEmpty(phoneWa) || !phoneWa?.[0].exists) {
-          const errMessage = 'phone number are not registrated!'
-          return res.status(400).json({ code: 400, message: errMessage })
-        }
-
-        const jid = phoneWa[0].jid
-
-        const data = await sock.sendMessage(jid, { text: value.message })
-        return res.status(200).json({ data })
-      }
-
-      const errMessage = 'please check your whatsapp connectivity'
-      return res.status(400).json({ code: 400, message: errMessage })
-    }
-  )
-
-  // @ts-expect-error
-  return sock
+  return await startWaSocket()
 }
 
 /**
  *
- * @param key
+ * @param session_id
  * @returns
  */
-async function getMessage(
-  key: WAMessageKey
-): Promise<WAMessageContent | undefined> {
-  if (store) {
-    const msg = await store.loadMessage(key.remoteJid!, key.id!)
-    return msg?.message ?? undefined
-  }
-
-  // only if store is present
-  return proto.Message.fromObject({})
+export function getSession(session_id: string): WASocket | undefined {
+  return WaSessions.get(session_id)
 }
 
-export default route
+/**
+ *
+ * @param session_id
+ * @returns
+ */
+export function isExistSession(session_id: string): boolean {
+  const storageFileAuth = authStorage(session_id)
+
+  if (
+    fs.existsSync(storageFileAuth) &&
+    fs.readdirSync(storageFileAuth) &&
+    getSession(session_id)
+  ) {
+    return true
+  }
+
+  return false
+}
+
+/**
+ *
+ * @param session_id
+ * @returns
+ */
+export function isShouldLoadSession(session_id: string): boolean {
+  const storageFileAuth = authStorage(session_id)
+
+  if (
+    fs.existsSync(storageFileAuth) &&
+    fs.readdirSync(storageFileAuth) &&
+    !getSession(session_id)
+  ) {
+    return true
+  }
+
+  return false
+}
+
+/**
+ * Load Session
+ */
+export function loadSession(): void {
+  const tempDir = path.resolve('temp')
+
+  if (fs.existsSync(tempDir)) {
+    fs.readdir(tempDir, async (err: any, dirs: string[]) => {
+      if (err) {
+        logger.error(`Error: ${err}`)
+        throw new ResponseError.InternalServer(
+          "can't load session, directory not found"
+        )
+      }
+
+      for (const dir of dirs) {
+        const session_id = dir.split('_')[0]
+        if (!isShouldLoadSession(session_id)) continue
+
+        await startBaileys({ session_id })
+      }
+    })
+  }
+}
+
+/**
+ * On Message Received
+ * @param listener
+ */
+export function onMessageReceived(
+  listener: (msg: { session_id: string }) => any
+): void {
+  WaCallback.set('on-message-received', listener)
+}
+
+/**
+ * On QR Code Updated
+ * @param listener
+ */
+export function onQRUpdated(
+  listener: ({ session_id, qrcode }: IOnQRUpdated) => any
+): void {
+  WaCallback.set('on-qr', listener)
+}
+
+/**
+ * On Connected
+ * @param listener
+ */
+export function onConnected(listener: (session_id: string) => any): void {
+  WaCallback.set('on-connected', listener)
+}
+
+/**
+ * On Connecting
+ * @param listener
+ */
+export function onConnecting(listener: (session_id: string) => any): void {
+  WaCallback.set('on-connecting', listener)
+}
+
+/**
+ * On Disconnected
+ * @param listener
+ */
+export function onDisconnected(listener: (session_id: string) => any): void {
+  WaCallback.set('on-disconnected', listener)
+}
+
+/**
+ *
+ * @param session_id
+ */
+export async function deleteSession(session_id: string): Promise<void> {
+  const session = getSession(session_id)
+  const storageFileAuth = authStorage(session_id)
+
+  try {
+    await session?.logout()
+  } catch (err) {
+    session?.end(undefined)
+    WaSessions.delete(session_id)
+
+    const authDir = path.resolve(storageFileAuth)
+    if (fs.existsSync(authDir)) {
+      fs.rmSync(authDir, { force: true, recursive: true })
+
+      const message = 'has been deleted, please create new session again!'
+      logger.info(`Session: ${session_id}, ${message}`)
+    }
+  }
+}

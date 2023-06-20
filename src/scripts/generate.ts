@@ -40,7 +40,7 @@ function generateEnv(value: string, regExp: RegExp): void {
   }
 }
 
-const listDirectory = ['public/uploads/temp', 'public/uploads/excel']
+const listDirectory = ['public/uploads/temp', 'public/uploads/excel', 'temp']
 
 for (let i = 0; i < listDirectory.length; i += 1) {
   const dir = listDirectory[i]

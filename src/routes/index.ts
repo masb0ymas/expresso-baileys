@@ -1,5 +1,4 @@
 import express, { type Request, type Response } from 'express'
-import waRoutes from '~/app/service/wasocket.service'
 import { env } from '~/config/env'
 import { BASE_URL_SERVER } from '~/core/constants/baseURL'
 import HttpResponse from '~/core/modules/response/HttpResponse'
@@ -61,6 +60,5 @@ route.get('/v1', function (req: Request, res: Response) {
 })
 
 route.use('/v1', v1Routes)
-route.use('/v1', waRoutes)
 
 export default route

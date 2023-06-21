@@ -5,13 +5,9 @@ import http from 'http'
 import { App } from './config/app'
 import { env } from './config/env'
 import { httpHandle } from './core/modules/http/handle'
-import { connectToWhatsapp } from './app/service/wasocket.service'
 
 function bootstrap(): void {
   const port = env.APP_PORT
-
-  // run wa socket
-  void connectToWhatsapp()
 
   // create express app
   const app = new App().create()
